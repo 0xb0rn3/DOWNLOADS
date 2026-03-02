@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""
+████████╗██╗   ██╗██████╗ ██████╗  ██████╗  ██████╗ ███████╗████████╗
+╚══██╔══╝██║   ██║██╔══██╗██╔══██╗██╔═══██╗██╔════╝ ██╔════╝╚══██╔══╝
+   ██║   ██║   ██║██████╔╝██████╔╝██║   ██║██║  ███╗█████╗     ██║   
+   ██║   ██║   ██║██╔══██╗██╔══██╗██║   ██║██║   ██║██╔══╝     ██║   
+   ██║   ╚██████╔╝██║  ██║██████╔╝╚██████╔╝╚██████╔╝███████╗   ██║   
+   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═════╝  ╚═════╝  ╚═════╝ ╚══════╝   ╚═╝   
+                  ⚡ ULTRA-FAST CLI DOWNLOADER ⚡
+"""
+
+import os
+import sys
+import re
+import time
+import shutil
+import subprocess
+import threading
+import urllib.request
+import urllib.parse
+import urllib.error
+from pathlib import Path
+from datetime import datetime
+
+# ── ANSI Colors ──────────────────────────────────────────────────────────────
+R  = "\033[91m"; G  = "\033[92m"; Y  = "\033[93m"
+B  = "\033[94m"; M  = "\033[95m"; C  = "\033[96m"
+W  = "\033[97m"; DIM = "\033[2m"; BOLD = "\033[1m"; RST = "\033[0m"
+
+def clr(text, color=W): return f"{color}{text}{RST}"
+def bold(text): return f"{BOLD}{text}{RST}"
+def banner():
+    print(clr("""
+████████╗██╗   ██╗██████╗ ██████╗  ██████╗  ██████╗ ███████╗████████╗
+╚══██╔══╝██║   ██║██╔══██╗██╔══██╗██╔═══██╗██╔════╝ ██╔════╝╚══██╔══╝
+   ██║   ██║   ██║██████╔╝██████╔╝██║   ██║██║  ███╗█████╗     ██║   
+   ██║   ██║   ██║██╔══██╗██╔══██╗██║   ██║██║   ██║██╔══╝     ██║   
+   ██║   ╚██████╔╝██║  ██║██████╔╝╚██████╔╝╚██████╔╝███████╗   ██║   
+   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═════╝  ╚═════╝  ╚═════╝ ╚══════╝   ╚═╝  """, C))
+    print(clr("              ⚡  ULTRA-FAST CLI DOWNLOADER  ⚡\n", Y))
+
+# ── Utility ───────────────────────────────────────────────────────────────────
+def human_size(b):
+    for u in ["B","KB","MB","GB","TB"]:
+        if b < 1024: return f"{b:.1f} {u}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+def human_speed(bps):
+    return f"{human_size(bps)}/s"
+
+def check_tool(name):
+    return shutil.which(name) is not None
+
+def ask_directory():
+    print(clr("\n📁 Where should files be downloaded?", Y))
+    print(clr(f"   [Press Enter for current dir: {os.getcwd()}]", DIM))
+    raw = input(clr("   Directory → ", B)).strip()
+    path = Path(raw) if raw else Path.cwd()
+    if not path.exists():
+        yn = input(clr(f"   {path} doesn't exist. Create it? [Y/n] ", Y)).strip().lower()
+        if yn in ("", "y"):
+            path.mkdir(parents=True)
+            print(clr(f"   ✓ Created {path}", G))
+        else:
+            print(clr("   ✗ Aborted.", R)); sys.exit(1)
+    return str(path.resolve())
+
+def is_magnet(url):
+    return url.startswith("magnet:")
+
+def is_torrent_file(url):
+    return url.lower().endswith(".torrent")
+
+def is_torrent(url):
+    return is_magnet(url) or is_torrent_file(url)
+
+# ── Progress bar (pure Python, no deps) ──────────────────────────────────────
+class ProgressBar:
+    def __init__(self, total=None, label=""):
+        self.total = total
+        self.label = label
+        self.done  = 0
+        self.start = time.time()
+        self._lock = threading.Lock()
+
+    def update(self, chunk):
+        with self._lock:
+            self.done += chunk
+            self._draw()
+
+    def _draw(self):
+        elapsed = max(time.time() - self.start, 0.001)
+        speed   = self.done / elapsed
+        cols    = shutil.get_terminal_size((80,20)).columns
+        if self.total:
+            pct  = min(self.done / self.total, 1.0)
+            bar_w = max(cols - 60, 10)
+            filled = int(bar_w * pct)
+            bar  = clr("█" * filled, G) + clr("░" * (bar_w - filled), DIM)
+            line = (f"\r  {clr(self.label[:20],'W')} [{bar}] "
+                    f"{clr(f'{pct*100:.1f}%',Y)} "
+                    f"{clr(human_size(self.done),'C')}/{clr(human_size(self.total),'C')} "
+                    f"{clr(human_speed(speed),M)}")
+        else:
+            spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(elapsed*8) % 10]
+            line = (f"\r  {clr(spinner, Y)} {clr(self.label[:30],'W')}  "
+                    f"{clr(human_size(self.done),'C')}  {clr(human_speed(speed),M)}")
+        print(line, end="", flush=True)
+
+    def finish(self):
+        self._draw()
+        elapsed = max(time.time() - self.start, 0.001)
+        avg = self.done / elapsed
+        print(f"  {clr('✓ Done','G')}  "
+              f"{clr(human_size(self.done),'C')} in "
+              f"{clr(f'{elapsed:.1f}s','Y')} avg "
+              f"{clr(human_speed(avg),M)}")
+
+# ── Downloader backends ───────────────────────────────────────────────────────
+
+def download_with_aria2c(url, dest_dir, connections=16):
+    """aria2c: fastest possible, supports HTTP/FTP/BitTorrent/Magnet"""
+    cmd = [
+        "aria2c",
+        "--dir", dest_dir,
+        "--max-connection-per-server", str(connections),
+        "--split", str(connections),
+        "--min-split-size", "1M",
+        "--max-concurrent-downloads", "5",
+        "--continue=true",
+        "--auto-file-renaming=false",
+        "--console-log-level=warn",
+        "--summary-interval=1",
+    ]
+    if is_torrent(url):
+        cmd += ["--seed-time=0"]  # download only, no seeding
+    cmd.append(url)
+    print(clr(f"\n  ⚡ aria2c → {url[:70]}…", C))
+    proc = subprocess.run(cmd, cwd=dest_dir)
+    return proc.returncode == 0
+
+def download_with_wget(url, dest_dir):
+    """wget fallback"""
+    cmd = ["wget", "--continue", "--show-progress",
+           "--progress=bar:force", "-P", dest_dir, url]
+    print(clr(f"\n  ⬇  wget → {url[:70]}…", C))
+    proc = subprocess.run(cmd)
+    return proc.returncode == 0
+
+def download_with_curl(url, dest_dir):
+    """curl fallback"""
+    fname = os.path.basename(urllib.parse.urlparse(url).path) or "download"
+    out   = os.path.join(dest_dir, fname)
+    cmd   = ["curl", "-L", "--continue-at", "-", "-#", "-o", out, url]
+    print(clr(f"\n  ⬇  curl → {url[:70]}…", C))
+    proc = subprocess.run(cmd)
+    return proc.returncode == 0
+
+def download_pure_python(url, dest_dir):
+    """Pure Python multi-chunk downloader (no external tools needed)"""
+    parsed = urllib.parse.urlparse(url)
+    fname  = os.path.basename(parsed.path) or "download"
+    fname  = urllib.parse.unquote(fname)
+    outpath = os.path.join(dest_dir, fname)
+
+    print(clr(f"\n  🐍 Python downloader → {url[:70]}…", C))
+
+    req = urllib.request.Request(url, headers={"User-Agent":"TurboGet/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total = int(resp.headers.get("Content-Length", 0)) or None
+            pb = ProgressBar(total=total, label=fname)
+            with open(outpath, "wb") as f:
+                while True:
+                    chunk = resp.read(1 << 17)  # 128 KB chunks
+                    if not chunk: break
+                    f.write(chunk)
+                    pb.update(len(chunk))
+            pb.finish()
+    except Exception as e:
+        print(clr(f"\n  ✗ Error: {e}", R))
+        return False
+    return True
+
+def handle_torrent_no_aria2c(url, dest_dir):
+    """Try libtorrent (python-libtorrent) for torrent/magnet if aria2c missing"""
+    try:
+        import libtorrent as lt
+    except ImportError:
+        print(clr("\n  ✗ Neither aria2c nor python-libtorrent found.", R))
+        print(clr("    Install: sudo apt install aria2  OR  pip install lbry-libtorrent", Y))
+        return False
+
+    ses = lt.session()
+    ses.listen_on(6881, 6891)
+    params = {"save_path": dest_dir, "storage_mode": lt.storage_mode_t.storage_mode_sparse}
+
+    if is_magnet(url):
+        print(clr(f"\n  🧲 Magnet → {url[:70]}…", M))
+        handle = lt.add_magnet_uri(ses, url, params)
+        print(clr("  ⏳ Fetching metadata…", Y))
+        while not handle.has_metadata():
+            time.sleep(1)
+        print(clr("  ✓ Metadata received", G))
+    else:
+        info   = lt.torrent_info(url)
+        handle = ses.add_torrent({"ti": info, **params})
+
+    print(clr("  ⚡ Downloading…\n", C))
+    while not handle.is_seed():
+        s = handle.status()
+        pb_str = "█" * int(s.progress * 40) + "░" * (40 - int(s.progress * 40))
+        print(f"\r  [{clr(pb_str, G)}] {clr(f'{s.progress*100:.1f}%',Y)} "
+              f"↓{clr(human_speed(s.download_rate),M)} "
+              f"peers:{clr(str(s.num_peers),C)}", end="", flush=True)
+        time.sleep(1)
+    print(clr("\n  ✓ Torrent complete!", G))
+    return True
+
+# ── Main downloader logic ─────────────────────────────────────────────────────
+
+def pick_backend_and_download(url, dest_dir):
+    torrent = is_torrent(url)
+
+    if check_tool("aria2c"):
+        ok = download_with_aria2c(url, dest_dir)
+    elif torrent:
+        ok = handle_torrent_no_aria2c(url, dest_dir)
+    elif check_tool("wget"):
+        ok = download_with_wget(url, dest_dir)
+    elif check_tool("curl"):
+        ok = download_with_curl(url, dest_dir)
+    else:
+        if torrent:
+            ok = handle_torrent_no_aria2c(url, dest_dir)
+        else:
+            ok = download_pure_python(url, dest_dir)
+    return ok
+
+def show_tool_status():
+    tools = [("aria2c","⚡ Best – HTTP/FTP/Torrent/Magnet"),
+             ("wget",  "✓ Good – HTTP/FTP"),
+             ("curl",  "✓ Good – HTTP/FTP")]
+    print(clr("\n  🔧 Available backends:", Y))
+    for t, desc in tools:
+        if check_tool(t):
+            print(f"    {clr('✓',G)} {clr(t,'W')} — {clr(desc,DIM)}")
+        else:
+            print(f"    {clr('✗',R)} {t} {clr('(not found)',DIM)}")
+    print()
+
+def get_urls_interactive():
+    print(clr("\n  📋 Enter URLs / magnet links (one per line).", W))
+    print(clr("     HTTP, HTTPS, FTP, .torrent URLs, magnet: links all supported.", DIM))
+    print(clr("     Type 'done' or press Enter on empty line to start.\n", DIM))
+    urls = []
+    while True:
+        raw = input(clr(f"  [{len(urls)+1}] URL → ", B)).strip()
+        if raw.lower() in ("done", "") and urls:
+            break
+        elif raw.lower() in ("done", ""):
+            if not urls:
+                print(clr("  ⚠  Please enter at least one URL.", Y))
+            continue
+        else:
+            urls.append(raw)
+            print(clr(f"     ✓ Added", G))
+    return urls
+
+def main():
+    banner()
+    show_tool_status()
+
+    # Recommend aria2c if missing
+    if not check_tool("aria2c"):
+        print(clr("  💡 TIP: Install aria2c for maximum speed!", Y))
+        print(clr("     Ubuntu/Debian: sudo apt install aria2", DIM))
+        print(clr("     macOS:         brew install aria2\n", DIM))
+
+    dest_dir = ask_directory()
+    print(clr(f"\n  📂 Download directory: {bold(dest_dir)}", G))
+
+    urls = get_urls_interactive()
+
+    print(clr(f"\n  🚀 Starting {len(urls)} download(s)…", Y))
+    print(clr("  " + "─"*60, DIM))
+
+    results = []
+    for i, url in enumerate(urls, 1):
+        print(clr(f"\n  [{i}/{len(urls)}]", Y), clr(url[:80], W))
+        t0 = time.time()
+        ok = pick_backend_and_download(url, dest_dir)
+        elapsed = time.time() - t0
+        results.append((url, ok, elapsed))
+
+    # Summary
+    print(clr("\n\n  " + "═"*60, C))
+    print(clr("  📊 SUMMARY", bold(C)))
+    print(clr("  " + "═"*60, C))
+    ok_count = sum(1 for _,o,_ in results if o)
+    for url, ok, elapsed in results:
+        icon  = clr("✓", G) if ok else clr("✗", R)
+        label = clr("OK  ", G) if ok else clr("FAIL", R)
+        print(f"  {icon} [{label}] {clr(f'{elapsed:.1f}s',Y)}  {url[:65]}")
+
+    print(clr(f"\n  {ok_count}/{len(results)} completed  →  {dest_dir}\n", G))
+
+    if ok_count < len(results):
+        sys.exit(1)
+
+# ── Entry ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(clr("\n\n  ⛔ Interrupted by user.", R))
+        sys.exit(130)
